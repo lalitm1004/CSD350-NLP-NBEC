@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 from abc import ABC
-from enum import Enum
+from enum import IntEnum
 from pathlib import Path
-from typing import List, Optional, Set, Type
+from typing import cast, List, Set, Type
 
 import pandas as pd
 import torch
 from pydantic import BaseModel
 from torch.utils.data import Dataset
+
 
 class NLP(ABC):
     @staticmethod
@@ -19,6 +20,7 @@ class NLP(ABC):
     def lemmatize(doc: List[str]) -> List[str]:
         raise NotImplementedError
 
+    @staticmethod
     def remove_stopwords(doc: List[str], stopwords: Set[str]) -> List[str]:
         return [token for token in doc if token not in stopwords]
 
@@ -32,13 +34,13 @@ class FeatureExtractor(ABC):
 class PreprocessingCFG(BaseModel):
     should_lemmatize: bool
     should_remove_stopwords: bool
-    stopwords: Optional[Set[str]]
+    stopwords: Set[str]
     nlp: Type[NLP]
 
 
-class Labels(Enum):
-    SPAM: 0
-    HAM: 1
+class Labels(IntEnum):
+    SPAM = 0
+    HAM = 1
 
 
 class NBDataset(Dataset):
@@ -49,18 +51,24 @@ class NBDataset(Dataset):
 
         self.df["text"] = self.df["text"].str.lower()
 
-        self.df["doc"] = self.df["text"].map(lambda x: self.cfg.nlp.tokenize(x))
+        self.df["doc"] = self.df["text"].map(
+            lambda x: self.cfg.nlp.tokenize(cast(str, x))
+        )
 
         if self.cfg.should_lemmatize:
-            self.df["doc"] = self.df["doc"].map(lambda x: cfg.nlp.lemmatize(x))
+            self.df["doc"] = self.df["doc"].map(
+                lambda x: cfg.nlp.lemmatize(cast(List[str], x))
+            )
 
         if self.cfg.should_remove_stopwords:
-            if len(self.cfg.stopwords) == 0:
-                raise RuntimeError
-            self.df["doc"] = self.df["doc"].map(lambda x: cfg.nlp.lemmatize(x))
+            self.df["doc"] = self.df["doc"].map(
+                lambda x: cfg.nlp.remove_stopwords(
+                    cast(List[str], x), self.cfg.stopwords
+                )
+            )
 
         self.df["features"] = self.df["tokenized_text"].map(
-            lambda x: self.fe.extract_features(x)
+            lambda x: self.fe.extract_features(cast(List[str], x), self)
         )
 
     def __len__(self):
