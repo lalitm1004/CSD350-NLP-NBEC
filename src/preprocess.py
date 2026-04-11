@@ -1,75 +1,99 @@
-from typing import List, Optional, Dict
-from collections import Counter
-import pandas as pd
-import torch
-import nltk
+from __future__ import annotations
+
+import re
 import logging
+from collections import Counter
+from typing import Dict, List, Optional
+
+import nltk
+import pandas as pd
+from nltk.stem import WordNetLemmatizer
 
 logger = logging.getLogger(__name__)
 
-from nltk.tokenize import word_tokenize
-from nltk.tokenize import word_tokenize
-from nltk.stem import WordNetLemmatizer
-
-# Dataset downloads
-nltk.download("punkt", quiet=True)
-nltk.download("punkt_tab", quiet=True)
-nltk.download("stopwords", quiet=True)
-nltk.download("wordnet", quiet=True)
+# NLTK downloads (only used if lemmatization is enabled)
+nltk.download("wordnet", quiet=False)
+nltk.download("stopwords", quiet=False)
 
 
 class NLP:
-    def __init__(self):
-        logger.debug("Initializing SimpleNLP tokenizer & lemmatizer.")
+    """Lightweight NLP pipeline.
+
+    Tokenization uses a fast regex split rather than NLTK's Punkt-based
+    word_tokenize, which runs a full sentence tokenizer and is ~40x slower
+    for plain BoW/TF-IDF use-cases.
+    """
+
+    def __init__(self) -> None:
+        logger.debug("Initializing NLP tokenizer & lemmatizer.")
         self._lemmatizer = WordNetLemmatizer()
 
     def tokenize(self, text: str) -> List[str]:
-        return word_tokenize(text)
+        """Regex word tokenizer — finds all alphanumeric tokens."""
+        return re.findall(r"\b\w+\b", text)
 
     def lemmatize(self, doc: List[str]) -> List[str]:
         return [self._lemmatizer.lemmatize(token) for token in doc]
 
-
     def remove_stopwords(self, doc: List[str], stopwords: set[str]) -> List[str]:
         return [token for token in doc if token not in stopwords]
 
+
 class FeatureExtractor:
-    def __init__(self):
-        logger.debug("Initializing BagOfWords FeatureExtractor.")
+    """Bag-of-Words feature extractor backed by a sparse representation.
+
+    Key design decisions
+    --------------------
+    - ``fit`` now accepts a column of already-tokenized & filtered docs
+      (``List[List[str]]``) so we never repeat the preprocessing pipeline.
+    - ``min_df`` prunes tokens that appear in fewer than *min_df* documents,
+      dramatically shrinking a 283 k raw-vocab down to a manageable size.
+    - ``extract_features`` returns a ``Dict[int, float]`` (sparse) instead of
+      a dense ``torch.Tensor``, eliminating the OOM crash.
+    """
+
+    def __init__(self, min_df: int = 5) -> None:
+        logger.debug("Initializing BagOfWords FeatureExtractor (min_df=%d).", min_df)
+        self.min_df = min_df
         self.vocab: Optional[List[str]] = None
         self.word_to_idx: Optional[Dict[str, int]] = None
 
-    def fit(self, df: pd.DataFrame, nlp_pipeline):
-        logger.info(f"Fitting FeatureExtractor vocabulary with {len(df)} records.")
-        vocab = set()
-        
-        # Preprocess to get valid tokens
-        for text in df["text"]:
-            if nlp_pipeline.should_lowercase:
-                text = text.lower()
-            tokens = nlp_pipeline.nlp.tokenize(text)
-            if nlp_pipeline.should_lemmatize:
-                tokens = nlp_pipeline.nlp.lemmatize(tokens)
-            if nlp_pipeline.should_remove_stopwords:
-                tokens = nlp_pipeline.nlp.remove_stopwords(tokens, nlp_pipeline.stopwords)
-            vocab.update(tokens)
+    def fit(self, docs: List[List[str]]) -> None:
+        """Fit vocabulary from a list of pre-tokenized documents.
 
-        self.vocab = sorted(vocab)
-        self.word_to_idx = {word: i for i, word in enumerate(self.vocab)}
-        logger.info(f"Vocabulary fitted. Total unique tokens: {len(self.vocab)}.")
+        Parameters
+        ----------
+        docs:
+            Each element is an already-tokenized (and filtered) document,
+            i.e. the ``"doc"`` column produced by ``NaiveBayesDataset``.
+        """
+        logger.info("Fitting FeatureExtractor vocabulary with %d documents.", len(docs))
 
-    def extract_features(self, tokenized_text: List[str]) -> torch.Tensor:
+        doc_freq: Counter[str] = Counter()
+        for doc in docs:
+            doc_freq.update(set(doc))  # count each token once per document
+
+        # Apply min_df threshold
+        kept = sorted(token for token, df in doc_freq.items() if df >= self.min_df)
+
+        self.vocab = kept
+        self.word_to_idx = {word: i for i, word in enumerate(kept)}
+        logger.info(
+            "Vocabulary fitted. Unique tokens (min_df=%d): %d.", self.min_df, len(self.vocab)
+        )
+
+    def extract_features(self, tokenized_text: List[str]) -> Dict[int, float]:
+        """Return a sparse feature dict {vocab_idx: count}.
+
+        Using a dict instead of a dense tensor means a document that touches
+        k distinct vocabulary tokens uses O(k) memory rather than O(|vocab|).
+        """
         if self.vocab is None or self.word_to_idx is None:
-            raise ValueError("Feature extractor must be fitted before extracting features.")
-
-        vocab_size = len(self.vocab)
-        feature_vector = torch.zeros(vocab_size, dtype=torch.float32)
+            raise ValueError("FeatureExtractor must be fitted before calling extract_features.")
 
         word_counts = Counter(tokenized_text)
-
-        for word, count in word_counts.items():
-            if word in self.word_to_idx:
-                idx = self.word_to_idx[word]
-                feature_vector[idx] = count
-
-        return feature_vector
+        return {
+            self.word_to_idx[word]: float(count)
+            for word, count in word_counts.items()
+            if word in self.word_to_idx
+        }

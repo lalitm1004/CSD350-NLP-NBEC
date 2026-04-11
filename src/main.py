@@ -1,97 +1,140 @@
-import pandas as pd
+"""main.py — load a trained NBEC model and classify an input phrase.
+
+Usage
+-----
+Interactive prompt:
+    uv run src/main.py
+
+Pass text directly as a command-line argument:
+    uv run src/main.py "Congratulations, you have won a free iPhone!"
+"""
+
+from __future__ import annotations
+
 import logging
 import sys
+from pathlib import Path
 
-# Configure tracing / logging to stdout
 logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(name)s:%(funcName)s:%(lineno)d - %(message)s",
-    stream=sys.stdout
+    level=logging.WARNING,          # suppress library noise; only show warnings+
+    format="%(levelname)s: %(message)s",
+    stream=sys.stderr,
 )
-logger = logging.getLogger(__name__)
 
-from dataset import NaiveBayesDataset, PreprocessingCFG, DATASET_PATH
-from preprocess import NLP, FeatureExtractor
-from model import NaiveBayesModel
-
+import torch
 from nltk.corpus import stopwords
 
-# =========================
-# Config
-# =========================
-nlp = NLP()
-feature_extractor = FeatureExtractor()
+from model import NaiveBayesModel
+from preprocess import NLP
 
-cfg = PreprocessingCFG(
-    should_lemmatize=False,
-    should_remove_stopwords=True,
-    should_lowercase=True,
-    stopwords=set(stopwords.words("english")),
-    feature_extractor=feature_extractor,
-    nlp=nlp,
-)
+# ──────────────────────────────────────────────────────────────────────────────
+# Paths
+# ──────────────────────────────────────────────────────────────────────────────
 
-# =========================
-# Load Dataset & Split
-# =========================
-logger.info("Loading dataset...")
-df = pd.read_csv(DATASET_PATH)
+WEIGHTS_PATH: Path = Path(__file__).parent.parent / "data" / "model_weights.pt"
 
-# Train/Test split of 80/20
-logger.info("Splitting dataset 80/20...")
-train_df = df.sample(frac=0.8, random_state=42)
-test_df = df.drop(train_df.index)
 
-logger.info(f"Train size: {len(train_df)}")
-logger.info(f"Test size: {len(test_df)}")
+# ──────────────────────────────────────────────────────────────────────────────
+# Inference helper
+# ──────────────────────────────────────────────────────────────────────────────
 
-logger.info("Fitting feature extractor on training data...")
-cfg.feature_extractor.fit(train_df, cfg)
+def classify(text: str, model: NaiveBayesModel, nlp: NLP, sw: set[str]) -> dict:
+    """Tokenise *text* and return prediction + confidence scores.
 
-logger.info("Preparing Train and Test Datasets...")
-train_dataset = NaiveBayesDataset(train_df, cfg)
-test_dataset = NaiveBayesDataset(test_df, cfg)
+    Returns
+    -------
+    dict with keys:
+        label       : "SPAM" or "HAM"
+        confidence  : probability of the predicted class (softmax of log-probs)
+        scores      : {"HAM": float, "SPAM": float}  — both class probabilities
+    """
+    tokens = nlp.tokenize(text.lower())
+    tokens = nlp.remove_stopwords(tokens, sw)
 
-# =========================
-# Train Model
-# =========================
-logger.info("Training model...")
-model = NaiveBayesModel(train_dataset)
-model.train()
-logger.info("Model trained")
+    sparse = model.dataset.feature_extractor.extract_features(tokens)  # type: ignore[attr-defined]
+    vocab_size = model.vocab_size
+    feat = torch.zeros(vocab_size, dtype=torch.float32)
+    for idx, val in sparse.items():
+        feat[idx] = val
 
-# =========================
-# Save Weights
-# =========================
-weights_path = Path("model_weights.pt")
-logger.info(f"Saving model weights to {weights_path}...")
-model.save_weights(
-    filepath=weights_path, 
-    vocab=cfg.feature_extractor.vocab, 
-    word_to_idx=cfg.feature_extractor.word_to_idx
-)
+    # Raw log-posteriors → softmax probabilities
+    tfidf = model._compute_tfidf(feat)
+    log_probs = model.log_priors + (model.log_likelihoods * tfidf).sum(dim=1)
+    probs = torch.softmax(log_probs, dim=0)
 
-# =========================
-# Load Weights & Evaluate
-# =========================
-logger.info(f"Loading model weights from {weights_path}...")
-loaded_model = NaiveBayesModel.load_weights(weights_path, test_dataset)
+    pred_idx = int(torch.argmax(probs).item())
+    label = "SPAM" if pred_idx == 1 else "HAM"
 
-logger.info("Evaluating on test set...")
-accuracy = loaded_model.evaluate()
-logger.info(f"Accuracy: {accuracy:.4f}")
+    return {
+        "label":      label,
+        "confidence": float(probs[pred_idx].item()),
+        "scores":     {"HAM": float(probs[0].item()), "SPAM": float(probs[1].item())},
+    }
 
-# =========================
-# Test Custom Input
-# =========================
-text = "Congratulations! You have won a free lottery ticket"
-logger.debug(f"Testing custom input: {text}")
 
-tokens = nlp.tokenize(text.lower())
-tokens = nlp.lemmatize(tokens)
-tokens = nlp.remove_stopwords(tokens, cfg.stopwords)
+def print_result(text: str, result: dict) -> None:
+    label = result["label"]
+    conf  = result["confidence"] * 100
+    ham_p = result["scores"]["HAM"]  * 100
+    spam_p= result["scores"]["SPAM"] * 100
+    bar_len = 30
+    filled = round(spam_p / 100 * bar_len)
+    bar = "█" * filled + "░" * (bar_len - filled)
 
-features = feature_extractor.extract_features(tokens)
+    print()
+    print(f'  Input  : "{text}"')
+    print(f"  Result : {label}  ({conf:.1f}% confidence)")
+    print(f"  HAM    : {ham_p:5.1f}%  |  SPAM : {spam_p:5.1f}%")
+    print(f"  Spam   : [{bar}]")
+    print()
 
-pred = loaded_model.predict(features)
-logger.info(f"Prediction for custom input: {'SPAM' if pred == 1 else 'HAM'}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    if not WEIGHTS_PATH.exists():
+        print(
+            f"ERROR: No model weights found at {WEIGHTS_PATH}\n"
+            "Run `uv run src/train_model.py` first to train and save the model.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"Loading model from {WEIGHTS_PATH}...", end=" ", flush=True)
+    model, feature_extractor = NaiveBayesModel.load_for_inference(WEIGHTS_PATH)
+    print("done.")
+    print(f"Vocabulary: {feature_extractor.vocab and len(feature_extractor.vocab):,} tokens")
+
+    nlp = NLP()
+    sw  = set(stopwords.words("english"))
+
+    # ── Input source: CLI arg or interactive loop ──────────────────────────
+    if len(sys.argv) > 1:
+        # Single phrase passed as a CLI argument
+        text = " ".join(sys.argv[1:])
+        result = classify(text, model, nlp, sw)
+        print_result(text, result)
+    else:
+        # Interactive loop
+        print("\nType a phrase and press Enter to classify it.")
+        print("Type 'quit' or press Ctrl-C to exit.\n")
+        while True:
+            try:
+                text = input("  > ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nBye!")
+                break
+
+            if not text:
+                continue
+            if text.lower() in {"quit", "exit", "q"}:
+                break
+
+            result = classify(text, model, nlp, sw)
+            print_result(text, result)
+
+
+if __name__ == "__main__":
+    main()
