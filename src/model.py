@@ -87,101 +87,56 @@ class NaiveBayesModel:
             self.dataset.features_matrix, batch_size=batch_size
         )
 
-        num_classes = self.num_classes
+        # Define positive class (SPAM = 1)
+        spam_class = 1
 
-        confusion_matrix = torch.zeros((num_classes, num_classes), dtype=torch.int64)
-        for actual, predicted in zip(true_labels, predicted_labels):
-            confusion_matrix[int(actual.item()), int(predicted.item())] += 1
+        tp = int(
+            ((predicted_labels == spam_class) & (true_labels == spam_class))
+            .sum()
+            .item()
+        )
 
-        total_samples = confusion_matrix.sum()
-        correct_predictions = confusion_matrix.diagonal().sum()
+        fp = int(
+            ((predicted_labels == spam_class) & (true_labels != spam_class))
+            .sum()
+            .item()
+        )
 
-        accuracy = (
-            float((correct_predictions.float() / total_samples.float()).item())
-            if total_samples.item() > 0
+        fn = int(
+            ((predicted_labels != spam_class) & (true_labels == spam_class))
+            .sum()
+            .item()
+        )
+
+        tn = int(
+            ((predicted_labels != spam_class) & (true_labels != spam_class))
+            .sum()
+            .item()
+        )
+
+        total = tp + tn + fp + fn
+
+        accuracy = (tp + tn) / total if total > 0 else 0.0
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+
+        f1_score = (
+            2 * precision * recall / (precision + recall)
+            if (precision + recall) > 0
             else 0.0
         )
 
-        class_names = [label.name for label in Labels]
-
-        per_class_metrics = []
-
-        precision_list = []
-        recall_list = []
-        f1_list = []
-
-        for class_index in range(num_classes):
-            true_positives = int(confusion_matrix[class_index, class_index].item())
-
-            false_positives = int(
-                (
-                    confusion_matrix[:, class_index].sum()
-                    - confusion_matrix[class_index, class_index]
-                ).item()
-            )
-
-            false_negatives = int(
-                (
-                    confusion_matrix[class_index, :].sum()
-                    - confusion_matrix[class_index, class_index]
-                ).item()
-            )
-
-            class_support = int(confusion_matrix[class_index, :].sum().item())
-
-            precision = (
-                true_positives / (true_positives + false_positives)
-                if (true_positives + false_positives) > 0
-                else 0.0
-            )
-
-            recall = (
-                true_positives / (true_positives + false_negatives)
-                if (true_positives + false_negatives) > 0
-                else 0.0
-            )
-
-            f1_score = (
-                2 * precision * recall / (precision + recall)
-                if (precision + recall) > 0
-                else 0.0
-            )
-
-            precision_list.append(precision)
-            recall_list.append(recall)
-            f1_list.append(f1_score)
-
-            per_class_metrics.append(
-                {
-                    "class_name": class_names[class_index],
-                    "precision": precision,
-                    "recall": recall,
-                    "f1_score": f1_score,
-                    "support": class_support,
-                    "true_positives": true_positives,
-                    "false_positives": false_positives,
-                    "false_negatives": false_negatives,
-                }
-            )
-
-        macro_precision = (
-            float(sum(precision_list) / len(precision_list)) if precision_list else 0.0
-        )
-
-        macro_recall = (
-            float(sum(recall_list) / len(recall_list)) if recall_list else 0.0
-        )
-
-        macro_f1 = float(sum(f1_list) / len(f1_list)) if f1_list else 0.0
-
         return {
             "accuracy": accuracy,
-            "confusion_matrix": confusion_matrix,
-            "class_names": class_names,
-            "per_class_metrics": per_class_metrics,
-            "macro_precision": macro_precision,
-            "macro_recall": macro_recall,
-            "macro_f1_score": macro_f1,
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1_score,
+            "true_positives": tp,
+            "false_positives": fp,
+            "false_negatives": fn,
+            "true_negatives": tn,
         }
 
     def _compute_tfidf(self, features: torch.Tensor) -> torch.Tensor:
@@ -206,18 +161,23 @@ class NaiveBayesModel:
         word_counts = torch.zeros(
             (self.num_classes, self.vocab_size), dtype=torch.float32
         )
+
         for class_idx in range(self.num_classes):
             indices = torch.nonzero(y == class_idx, as_tuple=False).flatten().tolist()
+
             if not indices:
                 continue
+
             summed = (
                 torch.as_tensor(x_sp[indices].sum(axis=0)).flatten().to(torch.float32)
             )
+
             word_counts[class_idx] = summed
 
         total_tokens = word_counts.sum(dim=1)
 
         class_counts = torch.bincount(y, minlength=self.num_classes).to(torch.float32)
+
         self.class_priors = class_counts / class_counts.sum().clamp(min=1e-8)
 
         self.likelihoods = (word_counts + self.alpha) / (
@@ -234,6 +194,7 @@ class NaiveBayesModel:
         word_to_idx: Dict[str, int],
     ) -> None:
         logger.debug("Saving model state to %s...", filepath)
+
         state = {
             "class_priors": self.class_priors,
             "likelihoods": self.likelihoods,
@@ -244,6 +205,7 @@ class NaiveBayesModel:
             "word_to_idx": word_to_idx,
             "vocab_size": self.vocab_size,
         }
+
         torch.save(state, filepath)
 
     @classmethod
@@ -251,18 +213,21 @@ class NaiveBayesModel:
         cls, filepath: Path, dataset: NaiveBayesDataset
     ) -> "NaiveBayesModel":
         logger.debug("Loading model state from %s...", filepath)
+
         state = torch.load(filepath, weights_only=False)
 
         dataset.feature_extractor.vocab = state["vocab"]
         dataset.feature_extractor.word_to_idx = state["word_to_idx"]
 
         model = cls(dataset)
+
         model.class_priors = state["class_priors"]
         model.likelihoods = state["likelihoods"]
         model.idf = state["idf"]
         model.log_priors = state["log_priors"]
         model.log_likelihoods = state["log_likelihoods"]
         model.vocab_size = state["vocab_size"]
+
         return model
 
     @classmethod
@@ -270,6 +235,7 @@ class NaiveBayesModel:
         cls, filepath: Path
     ) -> "tuple[NaiveBayesModel, FeatureExtractor]":
         logger.debug("Loading inference state from %s...", filepath)
+
         state = torch.load(filepath, weights_only=False)
 
         feature_extractor = FeatureExtractor()
